@@ -41,7 +41,7 @@ from langchain_core.messages import (
     ToolCall,
     ToolMessage,
 )
-from langchain_core.messages.ai import UsageMetadata
+from langchain_core.messages.ai import InputTokenDetails, UsageMetadata
 from langchain_core.messages.tool import tool_call_chunk as create_tool_call_chunk
 from langchain_core.output_parsers import (
     JsonOutputKeyToolsParser,
@@ -56,13 +56,13 @@ from langchain_core.runnables import (
 )
 from langchain_core.tools import BaseTool
 from langchain_core.utils import (
-    build_extra_kwargs,
     from_env,
     get_pydantic_field_names,
     secret_from_env,
 )
 from langchain_core.utils.function_calling import convert_to_openai_tool
 from langchain_core.utils.pydantic import is_basemodel_subclass
+from langchain_core.utils.utils import _build_model_kwargs
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -118,9 +118,13 @@ def _merge_messages(
     for curr in messages:
         curr = curr.model_copy(deep=True)
         if isinstance(curr, ToolMessage):
-            if isinstance(curr.content, list) and all(
-                isinstance(block, dict) and block.get("type") == "tool_result"
-                for block in curr.content
+            if (
+                isinstance(curr.content, list)
+                and curr.content
+                and all(
+                    isinstance(block, dict) and block.get("type") == "tool_result"
+                    for block in curr.content
+                )
             ):
                 curr = HumanMessage(curr.content)  # type: ignore[misc]
             else:
@@ -194,35 +198,35 @@ def _format_messages(
 
             # populate content
             content = []
-            for item in message.content:
-                if isinstance(item, str):
-                    content.append({"type": "text", "text": item})
-                elif isinstance(item, dict):
-                    if "type" not in item:
-                        raise ValueError("Dict content item must have a type key")
-                    elif item["type"] == "image_url":
+            for block in message.content:
+                if isinstance(block, str):
+                    content.append({"type": "text", "text": block})
+                elif isinstance(block, dict):
+                    if "type" not in block:
+                        raise ValueError("Dict content block must have a type key")
+                    elif block["type"] == "image_url":
                         # convert format
-                        source = _format_image(item["image_url"]["url"])
+                        source = _format_image(block["image_url"]["url"])
                         content.append({"type": "image", "source": source})
-                    elif item["type"] == "tool_use":
+                    elif block["type"] == "tool_use":
                         # If a tool_call with the same id as a tool_use content block
                         # exists, the tool_call is preferred.
-                        if isinstance(message, AIMessage) and item["id"] in [
+                        if isinstance(message, AIMessage) and block["id"] in [
                             tc["id"] for tc in message.tool_calls
                         ]:
                             overlapping = [
                                 tc
                                 for tc in message.tool_calls
-                                if tc["id"] == item["id"]
+                                if tc["id"] == block["id"]
                             ]
                             content.extend(
                                 _lc_tool_calls_to_anthropic_tool_use_blocks(overlapping)
                             )
                         else:
-                            item.pop("text", None)
-                            content.append(item)
-                    elif item["type"] == "text":
-                        text = item.get("text", "")
+                            block.pop("text", None)
+                            content.append(block)
+                    elif block["type"] == "text":
+                        text = block.get("text", "")
                         # Only add non-empty strings for now as empty ones are not
                         # accepted.
                         # https://github.com/anthropics/anthropic-sdk-python/issues/461
@@ -230,28 +234,44 @@ def _format_messages(
                             content.append(
                                 {
                                     k: v
-                                    for k, v in item.items()
+                                    for k, v in block.items()
                                     if k in ("type", "text", "cache_control")
                                 }
                             )
+                    elif block["type"] == "tool_result":
+                        tool_content = _format_messages(
+                            [HumanMessage(block["content"])]
+                        )[1][0]["content"]
+                        content.append({**block, **{"content": tool_content}})
                     else:
-                        content.append(item)
+                        content.append(block)
                 else:
                     raise ValueError(
-                        f"Content items must be str or dict, instead was: {type(item)}"
+                        f"Content blocks must be str or dict, instead was: "
+                        f"{type(block)}"
                     )
-        elif isinstance(message, AIMessage) and message.tool_calls:
-            content = (
-                []
-                if not message.content
-                else [{"type": "text", "text": message.content}]
-            )
-            # Note: Anthropic can't have invalid tool calls as presently defined,
-            # since the model already returns dicts args not JSON strings, and invalid
-            # tool calls are those with invalid JSON for args.
-            content += _lc_tool_calls_to_anthropic_tool_use_blocks(message.tool_calls)
         else:
             content = message.content
+
+        # Ensure all tool_calls have a tool_use content block
+        if isinstance(message, AIMessage) and message.tool_calls:
+            content = content or []
+            content = (
+                [{"type": "text", "text": message.content}]
+                if isinstance(content, str) and content
+                else content
+            )
+            tool_use_ids = [
+                cast(dict, block)["id"]
+                for block in content
+                if cast(dict, block)["type"] == "tool_use"
+            ]
+            missing_tool_calls = [
+                tc for tc in message.tool_calls if tc["id"] not in tool_use_ids
+            ]
+            cast(list, content).extend(
+                _lc_tool_calls_to_anthropic_tool_use_blocks(missing_tool_calls)
+            )
 
         formatted_messages.append({"role": role, "content": content})
     return system, formatted_messages
@@ -275,7 +295,7 @@ class ChatAnthropic(BaseChatModel):
             Name of Anthropic model to use. E.g. "claude-3-sonnet-20240229".
         temperature: float
             Sampling temperature. Ranges from 0.0 to 1.0.
-        max_tokens: Optional[int]
+        max_tokens: int
             Max number of tokens to generate.
 
     Key init args — client params:
@@ -630,11 +650,8 @@ class ChatAnthropic(BaseChatModel):
     @model_validator(mode="before")
     @classmethod
     def build_extra(cls, values: Dict) -> Any:
-        extra = values.get("model_kwargs", {})
         all_required_field_names = get_pydantic_field_names(cls)
-        values["model_kwargs"] = build_extra_kwargs(
-            extra, values, all_required_field_names
-        )
+        values = _build_model_kwargs(values, all_required_field_names)
         return values
 
     @model_validator(mode="after")
@@ -750,12 +767,7 @@ class ChatAnthropic(BaseChatModel):
             )
         else:
             msg = AIMessage(content=content)
-        # Collect token usage
-        msg.usage_metadata = {
-            "input_tokens": data.usage.input_tokens,
-            "output_tokens": data.usage.output_tokens,
-            "total_tokens": data.usage.input_tokens + data.usage.output_tokens,
-        }
+        msg.usage_metadata = _create_usage_metadata(data.usage)
         return ChatResult(
             generations=[ChatGeneration(message=msg)],
             llm_output=llm_output,
@@ -1166,14 +1178,10 @@ def _make_message_chunk_from_anthropic_event(
     message_chunk: Optional[AIMessageChunk] = None
     # See https://github.com/anthropics/anthropic-sdk-python/blob/main/src/anthropic/lib/streaming/_messages.py  # noqa: E501
     if event.type == "message_start" and stream_usage:
-        input_tokens = event.message.usage.input_tokens
+        usage_metadata = _create_usage_metadata(event.message.usage)
         message_chunk = AIMessageChunk(
             content="" if coerce_content_to_string else [],
-            usage_metadata=UsageMetadata(
-                input_tokens=input_tokens,
-                output_tokens=0,
-                total_tokens=input_tokens,
-            ),
+            usage_metadata=usage_metadata,
         )
     elif (
         event.type == "content_block_start"
@@ -1219,14 +1227,10 @@ def _make_message_chunk_from_anthropic_event(
                 tool_call_chunks=[tool_call_chunk],  # type: ignore
             )
     elif event.type == "message_delta" and stream_usage:
-        output_tokens = event.usage.output_tokens
+        usage_metadata = _create_usage_metadata(event.usage)
         message_chunk = AIMessageChunk(
             content="",
-            usage_metadata=UsageMetadata(
-                input_tokens=0,
-                output_tokens=output_tokens,
-                total_tokens=output_tokens,
-            ),
+            usage_metadata=usage_metadata,
             response_metadata={
                 "stop_reason": event.delta.stop_reason,
                 "stop_sequence": event.delta.stop_sequence,
@@ -1241,3 +1245,26 @@ def _make_message_chunk_from_anthropic_event(
 @deprecated(since="0.1.0", removal="0.3.0", alternative="ChatAnthropic")
 class ChatAnthropicMessages(ChatAnthropic):
     pass
+
+
+def _create_usage_metadata(anthropic_usage: BaseModel) -> UsageMetadata:
+    input_token_details: Dict = {
+        "cache_read": getattr(anthropic_usage, "cache_read_input_tokens", None),
+        "cache_creation": getattr(anthropic_usage, "cache_creation_input_tokens", None),
+    }
+
+    # Anthropic input_tokens exclude cached token counts.
+    input_tokens = (
+        getattr(anthropic_usage, "input_tokens", 0)
+        + (input_token_details["cache_read"] or 0)
+        + (input_token_details["cache_creation"] or 0)
+    )
+    output_tokens = getattr(anthropic_usage, "output_tokens", 0)
+    return UsageMetadata(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=input_tokens + output_tokens,
+        input_token_details=InputTokenDetails(
+            **{k: v for k, v in input_token_details.items() if v is not None}
+        ),
+    )
